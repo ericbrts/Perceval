@@ -28,8 +28,13 @@
 # SOFTWARE.
 
 import math
+import itertools
+import datetime
+from copy import deepcopy
 
-from perceval.utils import SVDistribution, StateVector, BasicState, anonymize_annotations, NoiseModel, global_params
+import numpy as np
+
+from perceval.utils import SVDistribution, StateVector, BasicState, anonymize_annotations, NoiseModel, global_params, Annotation
 from perceval.utils.logging import logger, channel
 from typing import Dict, List, Union
 
@@ -153,9 +158,9 @@ class Source:
         if self.partially_distinguishable:
             self._add(dist, ["_:0", "_:%s" % second_photon], (1 - distinguishability) * p2to2)
             self._add(dist, ["_:%s" % distinguishable_photon, "_:%s" % second_photon], distinguishability * p2to2)
-            self._add(dist, ["_:%s" % distinguishable_photon], distinguishability * (p1to1 + p2to1))
+            self._add(dist, ["_:%s" % distinguishable_photon], distinguishability * (p1to1 + p2to1) + p2to1)
             self._add(dist, ["_:0"], (1 - distinguishability) * (p1to1 + p2to1))
-            self._add(dist, ["_:%s" % second_photon], p2to1)
+            # self._add(dist, ["_:%s" % second_photon], p2to1)
         else:
             # Just avoids annotations
             self._add(dist, 2, p2to2)
@@ -231,3 +236,127 @@ class Source:
                 'brightness': self._emission_probability,
                 'indistinguishability': self._indistinguishability,
                 'g2_distinguishable': self._multiphoton_model == DISTINGUISHABLE_KEY}
+
+    def noisify(self, input_state: BasicState, prob_threshold: float = 0, min_photons: int = 0) -> SVDistribution:
+
+        prob_threshold = max(prob_threshold, global_params['min_p'])
+
+        class PhotonClass:
+            # _INDIST = '_:0'
+            # _DIST = '_:%d'
+
+            def __init__(self, prob, indist = 0, other_dist = 0):
+                self.indist = indist
+                self.other_dist = other_dist
+                self.prob = prob
+                # self._fixed_repr = False
+                # self._template_repr: str = ''
+                # self._prepare_repr()
+
+            @property
+            def n(self) -> int:
+                return self.indist + self.other_dist
+
+            # def _prepare_repr(self):
+            #     if self.other_dist == 0:
+            #         if self.indist == 0:
+            #             self._template_repr = None
+            #         else:
+            #             self._template_repr = [PhotonClass._INDIST] * self.indist
+            #         self._fixed_repr = True
+            #     else:
+            #         self._template_repr = [PhotonClass._INDIST] * self.indist + [PhotonClass._DIST] * self.other_dist
+            #
+            # def __repr(self):
+            #     return self._template_repr
+            #
+            # def repr(self, next_annot):
+            #     if self._fixed_repr:
+            #         return self._template_repr
+            #
+            #     res = deepcopy(self._template_repr)
+            #     for i in range(self.other_dist):
+            #         res[i+self.indist] = res[i+self.indist] % (next_annot[0]+i)
+            #     next_annot[0] += self.other_dist
+            #     return res
+
+        ANNOTS = {i: Annotation(f"_:{i}") for i in range(20)}
+
+        distinguishability = 1 - math.sqrt(self._indistinguishability)
+        photon_branches = []
+        (p1to1, p2to1, p2to2) = self._get_probs()
+        p0 = 1 - (p1to1 + 2 * p2to1 + p2to2)  # 2 * p2to1 because of symmetry
+
+        photon_branches.append(PhotonClass(p0))
+        photon_branches.append(PhotonClass((1 - distinguishability) * (p1to1 + p2to1), 1, 0))
+        photon_branches.append(PhotonClass(distinguishability * (p1to1 + p2to1) + p2to1, 0, 1))
+        photon_branches.append(PhotonClass((1 - distinguishability) * p2to2, 1, 1))
+        photon_branches.append(PhotonClass(distinguishability * p2to2, 0, 2))
+
+        ideal_photon_count = input_state.n
+        iterator = itertools.product([0,1,2,3,4], repeat=ideal_photon_count)
+
+        noisy_state = SVDistribution()
+        for nn, it in enumerate(iterator):
+            if nn % 100_000 == 0:
+                print("progress", nn/(5**ideal_photon_count))
+
+            photon_nb = sum([photon_branches[i].n for i in it])
+            if photon_nb < min_photons:
+                continue
+            p = np.prod([photon_branches[i].prob for i in it])
+            if p < prob_threshold:
+                continue
+
+
+            disting_photons_nb = sum([photon_branches[i].other_dist for i in it])
+            has_indist_photon = 1 if any([photon_branches[i].indist > 0 for i in it]) else 0
+            photon_vectors = np.zeros((disting_photons_nb + has_indist_photon, input_state.m), dtype=int)
+
+            indist_pos = None
+            dist_pos = 0
+            for j, i in enumerate(it):
+                dist = photon_branches[i].other_dist
+                indist = photon_branches[i].indist
+
+                if indist:
+                    if indist_pos is None:
+                        indist_pos = dist_pos
+                        dist_pos += 1
+                    photon_vectors[indist_pos, j] = 1
+                for d in range(dist):
+                    photon_vectors[dist_pos, j] = 1
+                    dist_pos += 1
+
+            annot_index = 0
+            # bs_res = BasicState(input_state.m)
+            # for v in photon_vectors:
+            #     bs = BasicState(v)
+            #     bs.inject_annotation(ANNOTS[annot_index])
+            #     annot_index += 1
+            #     bs_res = bs_res.merge(bs)
+            # noisy_state.add(bs_res, p)
+        noisy_state.normalize()
+        return noisy_state
+
+
+if __name__ == "__main__":
+    source = Source(
+        multiphoton_component=0.05,
+        indistinguishability=0.82,
+        losses=0.75)
+    #
+    # print(datetime.datetime.now())
+    # svd = source.noisify(BasicState([1]*10), min_photons=10)
+    # print(len(svd))
+    # print(svd)
+
+    print(datetime.datetime.now())
+    svd2 = source.generate_distribution(BasicState([1]*9), prob_threshold=1e-16)
+    print(len(svd2))
+    # print(svd2)
+
+    # for (sv1, p1), (sv2, p2) in zip(svd.items(), svd2.items()):
+    #     print(sv1, sv2, "v" if p1 == p2 else "x")
+
+    print(datetime.datetime.now())
